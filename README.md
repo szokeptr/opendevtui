@@ -1,24 +1,42 @@
 # OpenDevTUI
 
-OpenDevTUI is a Unix terminal UI for managing project-local development services from one screen. It can start, stop, restart, edit, and tail logs for configured commands such as `npm run dev`, `docker compose up`, or shell scripts.
+OpenDevTUI is a Unix terminal UI for managing project-local development services from one screen. It starts, stops, restarts, edits, and tails logs for configured commands such as `npm run dev`, `docker compose up`, or shell scripts.
+
+It is meant for local development workspaces and SSH sessions on trusted machines.
 
 ## Requirements
 
-- Rust toolchain
+- Rust toolchain, when building from source
 - Unix-like terminal environment
 - Commands you configure for services, such as `npm`, `docker`, or `bash`
 
-## Run Locally
+## Install
+
+Install from GitHub:
 
 ```sh
+cargo install --git https://github.com/szokeptr/opendevtui.git
+```
+
+Or clone and run locally:
+
+```sh
+git clone https://github.com/szokeptr/opendevtui.git
+cd opendevtui
 cargo run
 ```
 
-The app reads and writes its workspace configuration at:
+## Usage
+
+Run `opendevtui` from the root of the workspace whose services you want to manage.
+
+OpenDevTUI reads and writes workspace configuration at:
 
 ```text
 .opendevtui/config
 ```
+
+The config is local to that workspace. It is ignored by this repository by default because service definitions can contain machine-specific paths, commands, or environment values.
 
 ## Keyboard Shortcuts
 
@@ -57,6 +75,19 @@ args = ["scripts/worker.sh"]
 autostart = false
 ```
 
+Environment variables can be added to a service:
+
+```toml
+[[services]]
+id = "api"
+name = "API"
+cwd = "."
+command = "cargo"
+args = ["run"]
+env = { RUST_LOG = "debug" }
+autostart = false
+```
+
 ## Server Deployment
 
 OpenDevTUI is a terminal application, not an HTTP web server. The normal server deployment is to install it on a Linux VPS and run it over SSH.
@@ -69,7 +100,7 @@ After the repository is pushed to GitHub:
 ssh user@your-server
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-cargo install --git git@github.com:szokeptr/opendevtui.git
+cargo install --git https://github.com/szokeptr/opendevtui.git
 cd /path/to/your/workspace
 opendevtui
 ```
@@ -92,5 +123,10 @@ If you need access from a browser, put the TUI behind a terminal gateway such as
 
 ```sh
 cargo fmt
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
+
+## License
+
+MIT

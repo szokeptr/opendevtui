@@ -60,6 +60,7 @@ pub struct RawConfigEditorState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum EditorState {
     Form(FormEditorState),
     Raw(RawConfigEditorState),
@@ -224,6 +225,12 @@ impl TextBuffer {
             self.cursor_row += 1;
             self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
         }
+    }
+}
+
+impl Default for TextBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

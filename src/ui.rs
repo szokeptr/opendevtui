@@ -150,12 +150,7 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) -> Option<(u16, 
         ),
         Span::raw("  "),
         Span::styled("cpu ", subtle_accent_style()),
-        resource_value_span(
-            service
-                .runtime
-                .resource_usage
-                .map(|usage| format_cpu(usage)),
-        ),
+        resource_value_span(service.runtime.resource_usage.map(format_cpu)),
         Span::raw("  "),
         Span::styled("mem ", subtle_accent_style()),
         resource_value_span(service.runtime.resource_usage.map(format_memory)),

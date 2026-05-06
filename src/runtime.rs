@@ -1,5 +1,5 @@
 #[cfg(not(unix))]
-compile_error!("opendevtui v1 currently supports Unix terminals only");
+compile_error!("opendevtui currently supports Unix terminals only");
 
 use std::collections::HashMap;
 use std::path::PathBuf;

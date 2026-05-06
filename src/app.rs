@@ -39,6 +39,7 @@ pub enum FocusPane {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RightPaneMode {
     Logs,
     PresetPicker(PresetPickerState),

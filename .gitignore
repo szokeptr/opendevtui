@@ -1,1 +1,4 @@
 /target
+/.opendevtui
+*.log
+.DS_Store
