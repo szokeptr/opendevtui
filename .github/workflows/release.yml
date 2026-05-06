@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without a leading v
+        required: true
+        type: string
+      homebrew_tap:
+        description: GitHub tap repository to update
+        required: true
+        default: szokeptr/homebrew-tap
+        type: string
+      publish_homebrew:
+        description: Update the Homebrew tap formula
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version }}
+  TAG: v${{ inputs.version }}
+
+jobs:
+  prepare:
+    name: Prepare release commit and tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Validate version
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be SemVer without a leading v, for example 0.2.0" >&2
+            exit 1
+          fi
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Set crate version
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's/^version = ".*?"$/version = "$ENV{VERSION}"/m' Cargo.toml
+          cargo update --workspace
+          cargo test --locked
+
+      - name: Commit and tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "Cargo version is already $VERSION; tagging the current commit"
+          else
+            git commit -m "Release $TAG"
+          fi
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "$TAG"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="opendevtui-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/opendevtui" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opendevtui-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksum manifest
+        working-directory: dist
+        run: shasum -a 256 *.tar.gz > SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$TAG" --draft=false
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --target "${{ needs.prepare.outputs.commit }}"
+          fi
+
+  homebrew:
+    name: Update Homebrew tap
+    needs:
+      - prepare
+      - publish
+    if: inputs.publish_homebrew
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "Set HOMEBREW_TAP_TOKEN to a token with contents:write access to ${{ inputs.homebrew_tap }}" >&2
+            exit 1
+          fi
+
+      - name: Update formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: ${{ inputs.homebrew_tap }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git" homebrew-tap
+          cd homebrew-tap
+          mkdir -p Formula
+
+          source_url="https://github.com/${SOURCE_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          source_sha="$(curl -fsSL "$source_url" | shasum -a 256 | awk '{print $1}')"
+
+          cat > Formula/opendevtui.rb <<FORMULA
+          class Opendevtui < Formula
+            desc "Unix terminal UI for managing project-local development services"
+            homepage "https://github.com/${SOURCE_REPOSITORY}"
+            url "${source_url}"
+            sha256 "${source_sha}"
+            license "MIT"
+            head "https://github.com/${SOURCE_REPOSITORY}.git", branch: "main"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              assert_match "${VERSION}", shell_output("#{bin}/opendevtui --version")
+            end
+          end
+          FORMULA
+
+          ruby -pi -e 'sub(/^          /, "")' Formula/opendevtui.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/opendevtui.rb
+
+          if git diff --cached --quiet; then
+            echo "Homebrew formula already up to date"
+            exit 0
+          fi
+
+          git commit -m "opendevtui ${TAG}"
+          git push
