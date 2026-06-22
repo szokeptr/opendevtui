@@ -96,9 +96,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: "depot-macos-26"
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: "depot-macos-26"
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout tag
