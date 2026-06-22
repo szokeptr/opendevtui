@@ -59,6 +59,61 @@ The config is local to that workspace. It is ignored by this repository by defau
 - `Shift+C`: clear selected service logs
 - `q` or `Ctrl+C`: quit
 
+## Local Agent Socket
+
+OpenDevTUI always opens a project-scoped Unix socket when it starts. For example, a workspace at:
+
+```text
+/Users/szokeptr/code/bla
+```
+
+uses:
+
+```text
+/tmp/users-szokeptr/code/bla/opendevtui.sock
+```
+
+Local agents can call HTTP over that Unix socket:
+
+```text
+GET  /services
+GET  /services/{id}
+POST /services/{id}/start
+POST /services/{id}/stop
+POST /services/{id}/restart
+GET  /services/{id}/logs?tail=100
+POST /services/{id}/logs/clear
+```
+
+The socket is intended for local trusted agents running on the same machine. OpenDevTUI removes stale socket files on startup and removes its socket file on shutdown.
+
+## Codex MCP Server
+
+This repository also builds an MCP server binary for Codex:
+
+```sh
+cargo build --release --bins --locked
+```
+
+Register it in Codex as:
+
+```toml
+[mcp_servers.opendevtui]
+command = "/path/to/devtui/target/release/opendevtui-mcp"
+```
+
+Start `opendevtui` in your project first, then let Codex or another agent harness start the stdio MCP server in that same project. The MCP server connects to the deterministic project socket and exposes tools for the already-running OpenDevTUI instance:
+
+```text
+opendevtui_status
+opendevtui_list_services
+opendevtui_start_service
+opendevtui_stop_service
+opendevtui_restart_service
+opendevtui_get_logs
+opendevtui_clear_logs
+```
+
 ## Example Config
 
 ```toml

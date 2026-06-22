@@ -1,0 +1,10 @@
+name: devtui
+icon: null
+processes:
+  Run:
+    command: cargo build --release && cargo install --path . --locked
+    working_dir: null
+    auto_start: false
+    auto_restart: false
+    restart_when_changed: []
+    env: {}

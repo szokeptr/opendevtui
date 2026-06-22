@@ -2,7 +2,7 @@
 compile_error!("opendevtui currently supports Unix terminals only");
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::{
@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -23,7 +24,8 @@ use crate::config::ServiceConfig;
 
 const DEFAULT_STOP_TIMEOUT_MS: u64 = 2_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
     Stopped,
     Starting,
@@ -32,20 +34,21 @@ pub enum ServiceStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LogKind {
     Stdout,
     Stderr,
     System,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogEntry {
     pub kind: LogKind,
     pub line: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ResourceUsage {
     pub cpu_percent: f32,
     pub memory_kib: u64,
@@ -233,6 +236,13 @@ impl RuntimeController {
     pub fn sample_resource_usage(&self, pids: &[u32]) -> Result<HashMap<u32, ResourceUsage>> {
         sample_resource_usage(pids)
     }
+
+    pub fn sample_docker_resource_usage(
+        &self,
+        services: &[ServiceConfig],
+    ) -> Result<HashMap<String, ResourceUsage>> {
+        sample_docker_resource_usage(&self.inner.workspace_root, services)
+    }
 }
 
 fn sample_resource_usage(pids: &[u32]) -> Result<HashMap<u32, ResourceUsage>> {
@@ -299,6 +309,166 @@ fn parse_ps_resource_usage(output: &str) -> Result<HashMap<u32, ResourceUsage>> 
     }
 
     Ok(usages)
+}
+
+pub fn is_docker_service(service: &ServiceConfig) -> bool {
+    docker_compose_ps_args(service).is_some()
+}
+
+fn sample_docker_resource_usage(
+    workspace_root: &Path,
+    services: &[ServiceConfig],
+) -> Result<HashMap<String, ResourceUsage>> {
+    let mut usages = HashMap::new();
+
+    for service in services {
+        let Some((compose_command, compose_ps_args)) = docker_compose_ps_args(service) else {
+            continue;
+        };
+        let cwd = service.resolved_cwd(workspace_root);
+        let container_output = docker_command(&compose_command, &compose_ps_args, service, &cwd)
+            .with_context(|| format!("failed to list Docker containers for `{}`", service.id))?;
+        if !container_output.status.success() {
+            continue;
+        }
+
+        let container_ids = String::from_utf8_lossy(&container_output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if container_ids.is_empty() {
+            continue;
+        }
+
+        let mut stats_args = vec![
+            "stats".to_string(),
+            "--no-stream".to_string(),
+            "--format".to_string(),
+            "{{.CPUPerc}}\t{{.MemUsage}}".to_string(),
+        ];
+        stats_args.extend(container_ids);
+        let stats_output = docker_command("docker", &stats_args, service, &cwd)
+            .with_context(|| format!("failed to collect Docker stats for `{}`", service.id))?;
+        if !stats_output.status.success() {
+            continue;
+        }
+
+        usages.insert(
+            service.id.clone(),
+            parse_docker_stats_resource_usage(&String::from_utf8_lossy(&stats_output.stdout))?,
+        );
+    }
+
+    Ok(usages)
+}
+
+fn docker_command(
+    command: &str,
+    args: &[String],
+    service: &ServiceConfig,
+    cwd: &Path,
+) -> Result<std::process::Output> {
+    let mut command = StdCommand::new(command);
+    command.args(args).current_dir(cwd);
+    for (key, value) in &service.env {
+        command.env(key, value);
+    }
+    command.output().context("failed to run Docker command")
+}
+
+fn docker_compose_ps_args(service: &ServiceConfig) -> Option<(String, Vec<String>)> {
+    let command = Path::new(&service.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(service.command.as_str());
+
+    match command {
+        "docker" if service.args.first().map(String::as_str) == Some("compose") => {
+            compose_ps_args(&service.args).map(|args| ("docker".into(), args))
+        }
+        "docker-compose" => {
+            compose_ps_args(&service.args).map(|args| ("docker-compose".into(), args))
+        }
+        _ => None,
+    }
+}
+
+fn compose_ps_args(args: &[String]) -> Option<Vec<String>> {
+    let up_index = args.iter().position(|arg| arg == "up")?;
+    let mut ps_args = args[..up_index].to_vec();
+    ps_args.push("ps".into());
+    ps_args.push("-q".into());
+    Some(ps_args)
+}
+
+fn parse_docker_stats_resource_usage(output: &str) -> Result<ResourceUsage> {
+    let mut usage = ResourceUsage {
+        cpu_percent: 0.0,
+        memory_kib: 0,
+    };
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split('\t');
+        let cpu_percent = parts
+            .next()
+            .context("missing cpu usage in Docker stats output")?;
+        let memory_usage = parts
+            .next()
+            .context("missing memory usage in Docker stats output")?;
+
+        usage.cpu_percent += parse_percent(cpu_percent)
+            .with_context(|| format!("invalid cpu usage in Docker stats output: {line}"))?;
+        usage.memory_kib += parse_docker_memory_kib(memory_usage)
+            .with_context(|| format!("invalid memory usage in Docker stats output: {line}"))?;
+    }
+
+    Ok(usage)
+}
+
+fn parse_percent(value: &str) -> Result<f32> {
+    value
+        .trim()
+        .trim_end_matches('%')
+        .parse()
+        .with_context(|| format!("invalid percent value: {value}"))
+}
+
+fn parse_docker_memory_kib(value: &str) -> Result<u64> {
+    let current = value
+        .split('/')
+        .next()
+        .map(str::trim)
+        .context("missing current memory value")?;
+    parse_memory_quantity_kib(current)
+}
+
+fn parse_memory_quantity_kib(value: &str) -> Result<u64> {
+    let split_at = value
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit() && *ch != '.')
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+    let (amount, unit) = value.split_at(split_at);
+    let amount: f64 = amount
+        .parse()
+        .with_context(|| format!("invalid memory quantity: {value}"))?;
+    let kib = match unit.trim().to_ascii_lowercase().as_str() {
+        "b" => amount / 1024.0,
+        "kib" | "kb" | "k" => amount,
+        "mib" | "mb" | "m" => amount * 1024.0,
+        "gib" | "gb" | "g" => amount * 1024.0 * 1024.0,
+        "tib" | "tb" | "t" => amount * 1024.0 * 1024.0 * 1024.0,
+        "" => amount / 1024.0,
+        _ => bail!("unsupported memory unit in Docker stats output: {value}"),
+    };
+    Ok(kib.round() as u64)
 }
 
 async fn wait_for_exit(managed: &ManagedService, duration: Duration) -> Result<()> {
@@ -613,6 +783,51 @@ mod tests {
                 cpu_percent: 0.0,
                 memory_kib: 128,
             })
+        );
+    }
+
+    #[test]
+    fn docker_compose_ps_args_replaces_up_with_ps() {
+        let mut service = test_service(std::path::Path::new("/tmp"), "sleep 1");
+        service.command = "docker".into();
+        service.args = vec![
+            "compose".into(),
+            "-f".into(),
+            "compose.dev.yml".into(),
+            "up".into(),
+        ];
+
+        let (command, args) = docker_compose_ps_args(&service).unwrap();
+
+        assert_eq!(command, "docker");
+        assert_eq!(args, vec!["compose", "-f", "compose.dev.yml", "ps", "-q"]);
+        assert!(is_docker_service(&service));
+    }
+
+    #[test]
+    fn docker_compose_ps_args_supports_legacy_binary() {
+        let mut service = test_service(std::path::Path::new("/tmp"), "sleep 1");
+        service.command = "docker-compose".into();
+        service.args = vec!["up".into()];
+
+        let (command, args) = docker_compose_ps_args(&service).unwrap();
+
+        assert_eq!(command, "docker-compose");
+        assert_eq!(args, vec!["ps", "-q"]);
+    }
+
+    #[test]
+    fn parse_docker_stats_resource_usage_sums_containers() {
+        let usage =
+            parse_docker_stats_resource_usage("1.25%\t10.5MiB / 1GiB\n0.75%\t512KiB / 1GiB\n")
+                .unwrap();
+
+        assert_eq!(
+            usage,
+            ResourceUsage {
+                cpu_percent: 2.0,
+                memory_kib: 11_264,
+            }
         );
     }
 }

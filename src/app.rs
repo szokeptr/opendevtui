@@ -16,13 +16,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use crate::api::{self, ApiCommand, ApiError, ApiServer, LogsResponse, ServiceActionResponse};
 use crate::config::{AppConfig, ConfigStore, ServiceConfig, CONFIG_VERSION};
 use crate::editor::{
     EditorState, FormEditorState, FormField, FormMode, RawConfigEditorState, ServicePreset,
 };
 use crate::runtime::{
-    sanitize_log_line, LogEntry, LogKind, LogStream, RuntimeController, RuntimeEvent,
-    ServiceRuntime, ServiceStatus,
+    is_docker_service, sanitize_log_line, LogEntry, LogKind, LogStream, RuntimeController,
+    RuntimeEvent, ServiceRuntime, ServiceStatus,
 };
 use crate::ui;
 
@@ -31,6 +32,7 @@ const MAX_LOG_LINES: usize = 500;
 const MOUSE_SCROLL_LINES: i16 = 1;
 const PAGE_SCROLL_LINES: i16 = 8;
 const RESOURCE_REFRESH_MS: u64 = 1_000;
+const STATUS_MESSAGE_TTL: Duration = Duration::from_millis(2_500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -69,6 +71,7 @@ pub struct AppState {
     pub right_pane: RightPaneMode,
     pub wrap_logs: bool,
     pub status_message: Option<String>,
+    pub status_message_expires_at: Option<Instant>,
 }
 
 pub struct App {
@@ -76,6 +79,8 @@ pub struct App {
     store: ConfigStore,
     runtime: RuntimeController,
     runtime_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    api_rx: Option<mpsc::UnboundedReceiver<ApiCommand>>,
+    api_server: Option<ApiServer>,
     last_resource_refresh: Instant,
 }
 
@@ -125,12 +130,28 @@ impl App {
                 right_pane: RightPaneMode::Logs,
                 wrap_logs: false,
                 status_message: None,
+                status_message_expires_at: None,
             },
             store,
             runtime,
             runtime_rx,
+            api_rx: None,
+            api_server: None,
             last_resource_refresh: Instant::now(),
         })
+    }
+
+    pub async fn enable_api(&mut self) -> Result<PathBuf> {
+        let (api_tx, api_rx) = mpsc::unbounded_channel();
+        let server = api::start_server(&self.state.workspace_root, api_tx).await?;
+        let socket_path = server.socket_path.clone();
+        self.set_status_message(format!(
+            "control API socket listening at {}",
+            socket_path.display()
+        ));
+        self.api_rx = Some(api_rx);
+        self.api_server = Some(server);
+        Ok(socket_path)
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -140,12 +161,14 @@ impl App {
         let loop_result = async {
             loop {
                 self.drain_runtime_events();
+                self.drain_api_requests().await;
                 if self.last_resource_refresh.elapsed()
                     >= Duration::from_millis(RESOURCE_REFRESH_MS)
                 {
                     self.refresh_resource_usage();
                     self.last_resource_refresh = Instant::now();
                 }
+                self.clear_expired_status_message();
                 terminal.draw(|frame| {
                     let cursor = ui::render(frame, &self.state);
                     if let Some((x, y)) = cursor {
@@ -173,6 +196,44 @@ impl App {
         restore_terminal(&mut terminal)?;
         loop_result?;
         shutdown_result
+    }
+
+    pub async fn run_headless(&mut self) -> Result<()> {
+        self.autostart().await;
+        loop {
+            self.drain_runtime_events();
+            self.drain_api_requests().await;
+            if self.last_resource_refresh.elapsed() >= Duration::from_millis(RESOURCE_REFRESH_MS) {
+                self.refresh_resource_usage();
+                self.last_resource_refresh = Instant::now();
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(UI_POLL_MS)) => {}
+                _ = shutdown_signal() => break,
+            }
+        }
+        self.shutdown().await
+    }
+
+    fn set_status_message(&mut self, message: impl Into<String>) {
+        self.state.status_message = Some(message.into());
+        self.state.status_message_expires_at = Some(Instant::now() + STATUS_MESSAGE_TTL);
+    }
+
+    fn clear_status_message(&mut self) {
+        self.state.status_message = None;
+        self.state.status_message_expires_at = None;
+    }
+
+    fn clear_expired_status_message(&mut self) {
+        if self
+            .state
+            .status_message_expires_at
+            .is_some_and(|expires_at| expires_at <= Instant::now())
+        {
+            self.clear_status_message();
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -467,18 +528,20 @@ impl App {
         let Some(index) = self.selected_service_index() else {
             return;
         };
+        self.clear_service_logs(index);
+    }
+
+    fn clear_service_logs(&mut self, index: usize) {
         let service = &mut self.state.services[index];
         service.runtime.logs.clear();
         service.log_scroll = 0;
-        self.state.status_message = Some(format!(
-            "cleared logs for `{}`",
-            service.config.display_name()
-        ));
+        let display_name = service.config.display_name().to_string();
+        self.set_status_message(format!("cleared logs for `{display_name}`"));
     }
 
     fn toggle_log_wrap(&mut self) {
         self.state.wrap_logs = !self.state.wrap_logs;
-        self.state.status_message = Some(format!(
+        self.set_status_message(format!(
             "log wrap {}",
             if self.state.wrap_logs {
                 "enabled"
@@ -495,26 +558,47 @@ impl App {
             }
         }
 
+        let docker_services: Vec<ServiceConfig> = self
+            .state
+            .services
+            .iter()
+            .filter(|service| is_runtime_active(service.runtime.status))
+            .filter(|service| is_docker_service(&service.config))
+            .map(|service| service.config.clone())
+            .collect();
+        let docker_usages = if docker_services.is_empty() {
+            HashMap::new()
+        } else {
+            self.runtime
+                .sample_docker_resource_usage(&docker_services)
+                .unwrap_or_default()
+        };
+
         let pids: Vec<u32> = self
             .state
             .services
             .iter()
             .filter(|service| is_runtime_active(service.runtime.status))
+            .filter(|service| !is_docker_service(&service.config))
             .filter_map(|service| service.runtime.pid)
             .collect();
-        if pids.is_empty() {
-            return;
-        }
-
-        let Ok(usages) = self.runtime.sample_resource_usage(&pids) else {
-            return;
+        let process_usages = if pids.is_empty() {
+            HashMap::new()
+        } else {
+            self.runtime
+                .sample_resource_usage(&pids)
+                .unwrap_or_default()
         };
 
         for service in &mut self.state.services {
-            service.runtime.resource_usage = service
-                .runtime
-                .pid
-                .and_then(|pid| usages.get(&pid).copied());
+            service.runtime.resource_usage = if is_docker_service(&service.config) {
+                docker_usages.get(&service.config.id).copied()
+            } else {
+                service
+                    .runtime
+                    .pid
+                    .and_then(|pid| process_usages.get(&pid).copied())
+            };
         }
     }
 
@@ -530,8 +614,7 @@ impl App {
         for service_id in service_ids {
             if let Some(index) = self.index_of_service(&service_id) {
                 if let Err(err) = self.start_service(index).await {
-                    self.state.status_message =
-                        Some(format!("autostart failed for `{service_id}`: {err}"));
+                    self.set_status_message(format!("autostart failed for `{service_id}`: {err}"));
                 }
             }
         }
@@ -569,6 +652,10 @@ impl App {
         let Some(index) = self.selected_service_index() else {
             return Ok(());
         };
+        self.restart_service(index).await
+    }
+
+    async fn restart_service(&mut self, index: usize) -> Result<()> {
         let config = self.state.services[index].config.clone();
         self.state.services[index].runtime.status =
             if is_runtime_active(self.state.services[index].runtime.status) {
@@ -578,11 +665,11 @@ impl App {
             };
         match self.runtime.restart(config.clone()).await {
             Ok(()) => {
-                self.state.status_message = Some(format!("restarting `{}`", config.display_name()));
+                self.set_status_message(format!("restarting `{}`", config.display_name()));
             }
             Err(err) => {
                 self.state.services[index].runtime.status = ServiceStatus::Failed;
-                self.state.status_message = Some(err.to_string());
+                self.set_status_message(err.to_string());
             }
         }
         Ok(())
@@ -597,8 +684,7 @@ impl App {
             .config
             .clone();
         if is_runtime_active(self.state.services[index].runtime.status) {
-            self.state.status_message =
-                Some(format!("`{}` is already running", config.display_name()));
+            self.set_status_message(format!("`{}` is already running", config.display_name()));
             return Ok(());
         }
 
@@ -632,12 +718,12 @@ impl App {
         }
         match self.runtime.start(config.clone()).await {
             Ok(()) => {
-                self.state.status_message = Some(format!("starting `{}`", config.display_name()));
+                self.set_status_message(format!("starting `{}`", config.display_name()));
             }
             Err(err) => {
                 self.state.services[index].runtime.status = ServiceStatus::Failed;
                 self.state.services[index].runtime.resource_usage = None;
-                self.state.status_message = Some(err.to_string());
+                self.set_status_message(err.to_string());
             }
         }
         Ok(())
@@ -654,18 +740,17 @@ impl App {
         self.state.services[index].runtime.status = ServiceStatus::Stopping;
         match self.runtime.stop(&config.id).await {
             Ok(true) => {
-                self.state.status_message = Some(format!("stopping `{}`", config.display_name()));
+                self.set_status_message(format!("stopping `{}`", config.display_name()));
             }
             Ok(false) => {
                 self.state.services[index].runtime.status = ServiceStatus::Stopped;
                 self.state.services[index].runtime.resource_usage = None;
-                self.state.status_message =
-                    Some(format!("`{}` is not running", config.display_name()));
+                self.set_status_message(format!("`{}` is not running", config.display_name()));
             }
             Err(err) => {
                 self.state.services[index].runtime.status = ServiceStatus::Failed;
                 self.state.services[index].runtime.resource_usage = None;
-                self.state.status_message = Some(err.to_string());
+                self.set_status_message(err.to_string());
             }
         }
         Ok(())
@@ -744,7 +829,7 @@ impl App {
         self.persist_config()?;
         self.state.right_pane = RightPaneMode::Logs;
         self.state.focus = FocusPane::Services;
-        self.state.status_message = Some(format!("saved `{}`", service.display_name()));
+        self.set_status_message(format!("saved `{}`", service.display_name()));
         Ok(())
     }
 
@@ -782,7 +867,7 @@ impl App {
         }
         self.state.right_pane = RightPaneMode::Logs;
         self.state.focus = FocusPane::Services;
-        self.state.status_message = Some(format!("saved {}", self.state.config_path.display()));
+        self.set_status_message(format!("saved {}", self.state.config_path.display()));
         Ok(())
     }
 
@@ -849,7 +934,7 @@ impl App {
             return Ok(());
         };
         if is_runtime_active(self.state.services[index].runtime.status) {
-            self.state.status_message = Some("stop the service before deleting it".into());
+            self.set_status_message("stop the service before deleting it");
             self.state.right_pane = RightPaneMode::Logs;
             self.state.focus = FocusPane::Services;
             return Ok(());
@@ -864,7 +949,7 @@ impl App {
         self.persist_config()?;
         self.state.right_pane = RightPaneMode::Logs;
         self.state.focus = FocusPane::Services;
-        self.state.status_message = Some(format!("deleted `{}`", removed.config.display_name()));
+        self.set_status_message(format!("deleted `{}`", removed.config.display_name()));
         Ok(())
     }
 
@@ -893,16 +978,181 @@ impl App {
         }
     }
 
+    async fn drain_api_requests(&mut self) {
+        let mut commands = Vec::new();
+        if let Some(api_rx) = &mut self.api_rx {
+            while let Ok(command) = api_rx.try_recv() {
+                commands.push(command);
+            }
+        }
+
+        for command in commands {
+            self.handle_api_command(command).await;
+            self.drain_runtime_events();
+        }
+    }
+
+    async fn handle_api_command(&mut self, command: ApiCommand) {
+        match command {
+            ApiCommand::List { respond_to } => {
+                let _ = respond_to.send(Ok(self.service_snapshots()));
+            }
+            ApiCommand::Get {
+                service_id,
+                respond_to,
+            } => {
+                let _ = respond_to.send(self.api_service_snapshot(&service_id));
+            }
+            ApiCommand::Start {
+                service_id,
+                respond_to,
+            } => {
+                let result = self.api_start_service(&service_id).await;
+                let _ = respond_to.send(result);
+            }
+            ApiCommand::Stop {
+                service_id,
+                respond_to,
+            } => {
+                let result = self.api_stop_service(&service_id).await;
+                let _ = respond_to.send(result);
+            }
+            ApiCommand::Restart {
+                service_id,
+                respond_to,
+            } => {
+                let result = self.api_restart_service(&service_id).await;
+                let _ = respond_to.send(result);
+            }
+            ApiCommand::Logs {
+                service_id,
+                tail,
+                respond_to,
+            } => {
+                let _ = respond_to.send(self.api_logs(&service_id, tail));
+            }
+            ApiCommand::ClearLogs {
+                service_id,
+                respond_to,
+            } => {
+                let result = self.api_clear_logs(&service_id);
+                let _ = respond_to.send(result);
+            }
+        }
+    }
+
+    fn service_snapshots(&self) -> Vec<api::ServiceSnapshot> {
+        self.state
+            .services
+            .iter()
+            .map(|service| api::service_snapshot(&service.config, &service.runtime))
+            .collect()
+    }
+
+    fn api_service_snapshot(
+        &self,
+        service_id: &str,
+    ) -> std::result::Result<api::ServiceSnapshot, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        let service = &self.state.services[index];
+        Ok(api::service_snapshot(&service.config, &service.runtime))
+    }
+
+    async fn api_start_service(
+        &mut self,
+        service_id: &str,
+    ) -> std::result::Result<ServiceActionResponse, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        self.start_service(index)
+            .await
+            .map_err(|err| ApiError::failed(err.to_string()))?;
+        let service = self.api_service_snapshot(service_id)?;
+        Ok(ServiceActionResponse {
+            message: format!("start requested for `{service_id}`"),
+            service,
+        })
+    }
+
+    async fn api_stop_service(
+        &mut self,
+        service_id: &str,
+    ) -> std::result::Result<ServiceActionResponse, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        self.stop_service(index)
+            .await
+            .map_err(|err| ApiError::failed(err.to_string()))?;
+        let service = self.api_service_snapshot(service_id)?;
+        Ok(ServiceActionResponse {
+            message: format!("stop requested for `{service_id}`"),
+            service,
+        })
+    }
+
+    async fn api_restart_service(
+        &mut self,
+        service_id: &str,
+    ) -> std::result::Result<ServiceActionResponse, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        self.restart_service(index)
+            .await
+            .map_err(|err| ApiError::failed(err.to_string()))?;
+        let service = self.api_service_snapshot(service_id)?;
+        Ok(ServiceActionResponse {
+            message: format!("restart requested for `{service_id}`"),
+            service,
+        })
+    }
+
+    fn api_logs(
+        &self,
+        service_id: &str,
+        tail: Option<usize>,
+    ) -> std::result::Result<LogsResponse, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        let service = &self.state.services[index];
+        Ok(LogsResponse {
+            service: api::service_snapshot(&service.config, &service.runtime),
+            logs: api::log_snapshots(&service.runtime.logs, tail),
+        })
+    }
+
+    fn api_clear_logs(
+        &mut self,
+        service_id: &str,
+    ) -> std::result::Result<ServiceActionResponse, ApiError> {
+        let index = self
+            .index_of_service(service_id)
+            .ok_or_else(|| ApiError::not_found(service_id))?;
+        self.clear_service_logs(index);
+        let service = self.api_service_snapshot(service_id)?;
+        Ok(ServiceActionResponse {
+            message: format!("cleared logs for `{service_id}`"),
+            service,
+        })
+    }
+
     fn apply_runtime_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Started { service_id, pid } => {
                 if let Some(index) = self.index_of_service(&service_id) {
+                    let display_name = self.state.services[index].config.display_name().to_string();
                     let runtime = &mut self.state.services[index].runtime;
                     runtime.status = ServiceStatus::Running;
                     runtime.pid = Some(pid);
                     runtime.exit_code = None;
                     runtime.resource_usage = None;
                     push_log(runtime, LogKind::System, format!("started pid {pid}"));
+                    self.set_status_message(format!("started `{display_name}`"));
                 }
             }
             RuntimeEvent::Log {
@@ -926,6 +1176,7 @@ impl App {
                 exit_code,
             } => {
                 if let Some(index) = self.index_of_service(&service_id) {
+                    let display_name = self.state.services[index].config.display_name().to_string();
                     let runtime = &mut self.state.services[index].runtime;
                     runtime.status = ServiceStatus::Stopped;
                     runtime.pid = None;
@@ -935,7 +1186,8 @@ impl App {
                         Some(code) => format!("exited with {code}"),
                         None => "exited".into(),
                     };
-                    push_log(runtime, LogKind::System, message);
+                    push_log(runtime, LogKind::System, message.clone());
+                    self.set_status_message(format!("`{display_name}` {message}"));
                 }
             }
             RuntimeEvent::RuntimeError {
@@ -948,7 +1200,7 @@ impl App {
                     runtime.resource_usage = None;
                     push_log(runtime, LogKind::System, format!("error: {message}"));
                 }
-                self.state.status_message = Some(message);
+                self.set_status_message(message);
             }
         }
     }
@@ -1023,6 +1275,25 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     terminal.show_cursor().context("failed to show cursor")
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1082,10 +1353,13 @@ mod tests {
                 right_pane: RightPaneMode::Logs,
                 wrap_logs: false,
                 status_message: None,
+                status_message_expires_at: None,
             },
             store,
             runtime: RuntimeController::new(workspace_root.clone(), tx),
             runtime_rx: rx,
+            api_rx: None,
+            api_server: None,
             last_resource_refresh: Instant::now(),
         }
     }
@@ -1201,6 +1475,34 @@ mod tests {
         assert!(app.state.services[0].runtime.logs.is_empty());
         assert_eq!(app.state.services[0].log_scroll, 0);
         assert_eq!(app.state.services[1].runtime.logs.len(), 1);
+    }
+
+    #[test]
+    fn status_messages_expire() {
+        let mut app = seeded_app();
+        app.set_status_message("starting `API`");
+        assert_eq!(app.state.status_message.as_deref(), Some("starting `API`"));
+
+        app.state.status_message_expires_at = Some(Instant::now() - Duration::from_millis(1));
+        app.clear_expired_status_message();
+
+        assert_eq!(app.state.status_message, None);
+        assert_eq!(app.state.status_message_expires_at, None);
+    }
+
+    #[test]
+    fn started_event_replaces_starting_message() {
+        let mut app = seeded_app();
+        app.set_status_message("starting `API`");
+
+        app.apply_runtime_event(RuntimeEvent::Started {
+            service_id: "api".into(),
+            pid: 123,
+        });
+
+        assert_eq!(app.state.services[0].runtime.status, ServiceStatus::Running);
+        assert_eq!(app.state.status_message.as_deref(), Some("started `API`"));
+        assert!(app.state.status_message_expires_at.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

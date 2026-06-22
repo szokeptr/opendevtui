@@ -66,12 +66,10 @@ fn render_right_pane(frame: &mut Frame, area: Rect, state: &AppState) -> Option<
     match &state.right_pane {
         RightPaneMode::Logs => render_logs(frame, area, state),
         RightPaneMode::PresetPicker(picker) => {
-            render_preset_picker(frame, area, state, picker);
+            render_preset_picker(frame, area, picker);
             None
         }
-        RightPaneMode::Editor(EditorState::Form(editor)) => {
-            render_form_editor(frame, area, state, editor)
-        }
+        RightPaneMode::Editor(EditorState::Form(editor)) => render_form_editor(frame, area, editor),
         RightPaneMode::Editor(EditorState::Raw(raw)) => render_raw_editor(frame, area, state, raw),
         RightPaneMode::ConfirmDelete => {
             render_delete_confirmation(frame, area, state);
@@ -165,10 +163,6 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) -> Option<(u16, 
         vec![
             Line::from(""),
             Line::from(Span::styled("No logs yet", muted_style())),
-            Line::from(Span::styled(
-                "Keys: s/x/r control service, Shift+C clear logs, w wrap, e edit, a add, d delete, v raw config",
-                subtle_accent_style(),
-            )),
         ]
     } else {
         service
@@ -193,12 +187,7 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) -> Option<(u16, 
     None
 }
 
-fn render_preset_picker(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    picker: &PresetPickerState,
-) {
+fn render_preset_picker(frame: &mut Frame, area: Rect, picker: &PresetPickerState) {
     let block = Block::default()
         .title(Span::styled(" Add Service ", title_style(true)))
         .borders(Borders::ALL)
@@ -227,16 +216,11 @@ fn render_preset_picker(
     let mut stateful = ListState::default();
     stateful.select(Some(picker.selected));
     frame.render_stateful_widget(list, inner, &mut stateful);
-
-    if let Some(message) = &state.status_message {
-        render_status(frame, area, message);
-    }
 }
 
 fn render_form_editor(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
     editor: &FormEditorState,
 ) -> Option<(u16, u16)> {
     let block = Block::default()
@@ -346,7 +330,7 @@ fn render_form_editor(
         chunks[2],
     );
 
-    if let Some(message) = editor.error.as_deref().or(state.status_message.as_deref()) {
+    if let Some(message) = editor.error.as_deref() {
         render_status(frame, area, message);
     }
 
@@ -407,7 +391,7 @@ fn render_raw_editor(
         chunks[1],
     );
 
-    if let Some(message) = raw.error.as_deref().or(state.status_message.as_deref()) {
+    if let Some(message) = raw.error.as_deref() {
         render_status(frame, area, message);
     }
 
@@ -491,10 +475,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         FocusPane::Services => "SERVICES",
         FocusPane::Details => "DETAILS",
     };
-    let status = state.status_message.as_deref().unwrap_or(
-        "j/k move  Tab switch pane  s/x/r control  Shift+C clear  w wrap  e edit  a add  d delete  v raw  q quit",
-    );
-    let line = Line::from(vec![
+    let hints = shortcut_hints(state);
+    let mut spans = vec![
         Span::styled(format!(" {} ", mode), badge_style(PALETTE.accent)),
         Span::raw(" "),
         Span::styled(
@@ -504,9 +486,56 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(status.to_string(), muted_style()),
-    ]);
+    ];
+    if let Some(message) = &state.status_message {
+        spans.push(Span::styled(message.to_string(), content_style()));
+        spans.push(Span::styled("  |  ", muted_style()));
+    }
+    spans.push(Span::styled(hints, muted_style()));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).style(footer_style()), area);
+}
+
+fn shortcut_hints(state: &AppState) -> String {
+    match &state.right_pane {
+        RightPaneMode::Logs => logs_shortcut_hints(state),
+        RightPaneMode::PresetPicker(_) => "j/k choose  Enter add preset  Esc cancel".into(),
+        RightPaneMode::Editor(EditorState::Form(editor)) if editor.is_editing => {
+            let done = if editor.selected_field.is_multiline() {
+                "Esc done"
+            } else {
+                "Enter done"
+            };
+            format!("{done}  type to edit")
+        }
+        RightPaneMode::Editor(EditorState::Form(editor)) => {
+            let edit = if editor.selected_field == FormField::Autostart {
+                "Enter/Space toggle"
+            } else {
+                "Enter/i edit"
+            };
+            format!("j/k field  {edit}  Ctrl+S save  Esc cancel")
+        }
+        RightPaneMode::Editor(EditorState::Raw(_)) => "Ctrl+S save  Esc discard".into(),
+        RightPaneMode::ConfirmDelete => "Enter/y delete  n/Esc cancel".into(),
+    }
+}
+
+fn logs_shortcut_hints(state: &AppState) -> String {
+    if state.services.is_empty() {
+        return "a add service  v raw config  q quit".into();
+    }
+
+    match state.focus {
+        FocusPane::Services => {
+            "j/k move  Tab logs  s start  x stop  r restart  e edit  a add  d delete  v raw  q quit"
+                .into()
+        }
+        FocusPane::Details => {
+            "j/k service  Up/Down scroll  PgUp/PgDn page  w wrap  Shift+C clear  Tab services  q quit"
+                .into()
+        }
+    }
 }
 
 fn status_label(status: ServiceStatus) -> &'static str {

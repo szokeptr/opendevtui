@@ -4,9 +4,9 @@ const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Run,
+    Run { headless: bool },
     Help,
     Version,
 }
@@ -16,14 +16,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut command = Command::Run;
-
+    let mut command = Command::Run { headless: false };
+    let mut headless = false;
     for arg in args {
         match arg.as_ref() {
             "-h" | "--help" => command = Command::Help,
             "-V" | "--version" => command = Command::Version,
+            "--headless" => headless = true,
             unknown => bail!("unknown argument '{unknown}'\n\n{}", help_text()),
         }
+    }
+
+    if matches!(command, Command::Run { .. }) {
+        command = Command::Run { headless };
     }
 
     Ok(command)
@@ -42,8 +47,9 @@ Usage:
   {BIN_NAME} [OPTIONS]
 
 Options:
-  -h, --help       Print help
-  -V, --version    Print version
+      --headless           Run without terminal UI, for local agents
+  -h, --help               Print help
+  -V, --version            Print version
 "
     )
 }
@@ -64,8 +70,25 @@ mod tests {
     fn defaults_to_running_app_without_args() {
         assert_eq!(
             parse_args(std::iter::empty::<&str>()).unwrap(),
-            Command::Run
+            Command::Run { headless: false }
         );
+    }
+
+    #[test]
+    fn parses_headless_flag() {
+        assert_eq!(
+            parse_args(["--headless"]).unwrap(),
+            Command::Run { headless: true }
+        );
+    }
+
+    #[test]
+    fn rejects_removed_api_flags() {
+        let err = parse_args(["--api-socket", "/tmp/nope.sock"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown argument '--api-socket'"));
     }
 
     #[test]

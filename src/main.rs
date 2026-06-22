@@ -14,10 +14,17 @@ async fn main() -> Result<()> {
             println!("{}", version_text());
             return Ok(());
         }
-        Command::Run => {}
+        Command::Run { headless } => {
+            let workspace_root = std::env::current_dir()
+                .and_then(|path| path.canonicalize())
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let mut app = opendevtui::app::App::load(workspace_root).await?;
+            app.enable_api().await?;
+            return if headless {
+                app.run_headless().await
+            } else {
+                app.run().await
+            };
+        }
     }
-
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut app = opendevtui::app::App::load(workspace_root).await?;
-    app.run().await
 }
