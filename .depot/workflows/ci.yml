@@ -1,0 +1,25 @@
+# Depot CI Migration
+# Source: .github/workflows/ci.yml
+#
+# Changes made:
+# - Changed GitHub runs-on labels to their Depot equivalents
+
+name: CI
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    name: Test
+    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
