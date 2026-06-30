@@ -14,6 +14,9 @@ async fn main() -> Result<()> {
             println!("{}", version_text());
             return Ok(());
         }
+        Command::McpInstall(args) => {
+            return opendevtui::install::run(args);
+        }
         Command::Run { headless } => {
             let workspace_root = std::env::current_dir()
                 .and_then(|path| path.canonicalize())

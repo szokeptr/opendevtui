@@ -87,22 +87,50 @@ POST /services/{id}/logs/clear
 
 The socket is intended for local trusted agents running on the same machine. OpenDevTUI removes stale socket files on startup and removes its socket file on shutdown.
 
-## Codex MCP Server
+## MCP Server
 
-This repository also builds an MCP server binary for Codex:
+This repository also builds an MCP server binary (`opendevtui-mcp`) that lets a coding agent control the running OpenDevTUI instance.
+
+### Install
+
+The easiest way to register it is the interactive installer, which writes the right config for your agent:
+
+```sh
+opendevtui mcp install
+```
+
+It asks which coding tool (Claude Code, Codex, or opencode) and whether to install for the **user** (all projects) or the current **project** (repository), then merges the server entry into that tool's configuration:
+
+| Tool        | User scope                            | Project scope            |
+| ----------- | ------------------------------------- | ------------------------ |
+| Claude Code | `~/.claude.json`                      | `.mcp.json`              |
+| Codex       | `~/.codex/config.toml`                | `.codex/config.toml`     |
+| opencode    | `~/.config/opencode/opencode.json`    | `opencode.json`          |
+
+The installer points each config at the absolute path of the `opendevtui-mcp` binary sitting next to your `opendevtui` executable. Existing configuration in those files is preserved.
+
+You can also run it non-interactively:
+
+```sh
+opendevtui mcp install --tool codex --scope user
+```
+
+### Manual setup
+
+To register it by hand instead, build the binaries and add the server yourself, e.g. for Codex:
 
 ```sh
 cargo build --release --bins --locked
 ```
-
-Register it in Codex as:
 
 ```toml
 [mcp_servers.opendevtui]
 command = "/path/to/devtui/target/release/opendevtui-mcp"
 ```
 
-Start `opendevtui` in your project first, then let Codex or another agent harness start the stdio MCP server in that same project. The MCP server connects to the deterministic project socket and exposes tools for the already-running OpenDevTUI instance:
+### Tools
+
+Start `opendevtui` in your project first, then let the agent harness start the stdio MCP server in that same project. The MCP server connects to the deterministic project socket and exposes tools for the already-running OpenDevTUI instance:
 
 ```text
 opendevtui_status
